@@ -3,6 +3,12 @@
 ## Overview
 This project implements and optimizes a GPU-based Marching Cubes pipeline using CUDA. The focus is on correctness, performance measurement, and memory-aware GPU optimization. Multiple optimization stages can be enabled at runtime to compare baseline and optimized variants.
 
+## Repo Note
+This repository contains my implementation of the X component from a university course project.
+
+The original project repository was hosted on LRZ GitLab.  
+Only the part I developed is included here.
+
 ## Build & Run
 Build steps (headless mode, OpenGL viewer disabled due to OS and headless environment limitation, this project was built on MacOS):
 
