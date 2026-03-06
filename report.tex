@@ -1,0 +1,270 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{booktabs}
+\usepackage{listings}
+\usepackage{float}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=black,
+  urlcolor=blue
+}
+
+
+
+\begin{document}
+\begin{titlepage}
+    \centering
+    \vspace*{\fill}
+
+    {\LARGE \textbf{GPU-Based Marching Cubes (CUDA)}\par}
+    \vspace{1.5cm}
+
+    {\large
+        \textbf{Technical University of Munich (TUM) }
+
+    \textbf{Hoda Bahaaaldeen}\par 
+    \vspace{0.5cm}
+    GPU Computing\par
+    Winter 2025\par
+    \vspace{0.5cm}
+    }
+
+    \vspace{1.5cm}
+    {\large \today\par}
+
+    \vspace*{\fill}
+\end{titlepage}
+
+\clearpage
+\tableofcontents
+\clearpage
+
+\listoftables
+\clearpage
+
+
+\section{Scope and Baseline}
+
+Marching Cubes extracts an isosurface from a three-dimensional scalar field by processing each grid cell independently and emitting triangles based on a fixed case table. The baseline implementation executes a CUDA pipeline that generates a triangle mesh and writes it to \texttt{triangles.txt}. \\
+
+The atomic baseline output is numerically stable (identical grid size and vertex/index counts) but not byte-identical across runs due to non-deterministic parallel output ordering.
+
+
+\section{Environment and Build}
+
+All experiments were executed on an LRZ GPU cluster in a headless environment. The provided OpenGL viewer was disabled due to OS limitations (MacOs) ; correctness and performance were evaluated numerically.
+
+\begin{lstlisting}[language=bash]
+mkdir -p build && cd build
+cmake .. -DBUILD_VIEWER=OFF
+make -j
+\end{lstlisting}
+
+
+\section{Correctness Validation}
+
+Correctness was validated using stable invariants across runs:
+\begin{itemize}
+  \item Scalar field size remains constant: $388 \times 68 \times 388$.
+  \item Vertex and index counts remain constant across repeated runs
+        (baseline: 1,233,510 each).
+  \item Triangle counts match between baseline and optimized variants under
+        deterministic input.
+\end{itemize}
+
+Differences in output ordering (SHA256 checksum) are expected between the atomic baseline and the scan-based pipeline and do not affect surface geometry or topology.
+
+
+\section{Measurement Methodology}
+
+Kernel runtime was measured using CUDA events and restricted to the Marching Cubes compute stage. Memory allocation, host--device transfers, and file I/O were excluded.
+
+Each configuration used warm-up runs followed by measured iterations, reporting mean, minimum, and standard deviation. Output counters were reset between runs, and a final separate execution was used for writing \texttt{triangles.txt}.
+
+\subsection{Baseline Timing}
+
+\begin{table}[H]
+\centering
+\caption{Baseline kernel timing (CUDA events).}
+\label{tab:baseline_timing}
+\begin{tabular}{lccccc}
+\toprule
+Grid Size & Warmup & Runs & Mean (ms) & Min (ms) & Std (ms) \\
+\midrule
+$388 \times 68 \times 388$ & 1 & 5 & 1.268 & 1.265 & 0.0022 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Profiling and Bottleneck Identification}
+
+Nsight Systems confirms execution is dominated by the Marching Cubes kernel.
+Nsight Compute reveals a memory-bound workload.
+
+\begin{table}[H]
+\centering
+\caption{Baseline profiling summary (Nsight Compute).}
+\label{tab:baseline_profiling}
+\begin{tabular}{lc}
+\toprule
+Metric & Value \\
+\midrule
+Memory Throughput & $\sim$65\% \\
+Compute Throughput & $\sim$15\% \\
+L2 Cache Throughput & $\sim$77\% \\
+DRAM Throughput & $\sim$35\% \\
+Achieved Occupancy & $\sim$75\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The kernel spends most of its time stalled on memory operations rather than arithmetic, motivating optimizations that reduce synchronization and unnecessary memory traffic.
+
+\section{Implemented Optimizations and Evidence}
+
+
+\subsection{Atomic-Free Multi-Pass Output Compaction}
+
+\paragraph{Goal}
+Remove global atomic operations and determine the exact size of the output in advance.
+
+\paragraph{Design}
+The baseline uses global atomic counters to reserve output space, causing serialization. This was replaced by a three-pass GPU pipeline: count per-cell triangles, perform an exclusive prefix sum using in-kernel
+\texttt{cub::BlockScan}, and emit triangles into precomputed ranges without
+global atomics.
+
+\begin{table}[H]
+\centering
+\caption{Baseline vs.\ multi-pass compaction (deterministic input).}
+\label{tab:opt1_results}
+\begin{tabular}{lccc}
+\toprule
+Version & Mean Time (ms) & Speedup & Triangles \\
+\midrule
+Baseline (atomic emission) & 1.269 & 1.00$\times$ & 411,170 \\
+Multi-pass compaction & 0.745 & 1.70$\times$ & 411,170 \\
+\bottomrule
+\end{tabular}
+\end{table}
+\textit{While triangle counts are identical, the scan-based pipeline produces a deterministic output layout that differs from the atomic baseline’s emission order.}
+\paragraph{Performance and analysis}
+The expected reduction in serialization and improved memory write locality resulted in a 1.7$\times$ speedup. Profiling confirms that eliminating atomic contention significantly improves effective bandwidth, even though the kernel remains memory-bound.
+
+
+\subsection{Chunk-Based Empty-Region Culling}
+
+\paragraph{Goal}
+Skip regions of the volume that cannot generate any triangles.
+
+\paragraph{Design}
+The volume is partitioned into $8\times8\times8$ cell chunks. A persistent per-chunk mask identifies active chunks, which are compacted into an ID list. All subsequent kernels operate only on this list.
+
+\begin{table}[H]
+\centering
+\caption{Chunk culling impact.}
+\label{tab:opt2_results}
+\begin{tabular}{lcccc}
+\toprule
+Field & Culling & Active Chunks & Mean (ms) & Speedup \\
+\midrule
+Terrain & OFF & -- & 0.741 & 1.00$\times$ \\
+Terrain & ON  & 3054 / 21609 & 0.532 & 1.39$\times$ \\
+Plane   & OFF & -- & 0.500 & 1.48$\times$ \\
+Plane   & ON  & 2401 / 21609 & 0.350 & 2.10$\times$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Performance and analysis}
+As expected, culling yields moderate gains for dense terrain and substantial gains for sparse plane fields. The results confirm that skipping empty chunks reduces memory traffic and kernel work proportionally to sparsity.
+
+\subsection{Shared-Memory Tiling Attempt}
+
+\paragraph{Goal}
+Reduce redundant scalar-field loads within a chunk.
+
+\paragraph{Design}
+Each active chunk cooperatively loads a $(\texttt{CHUNK}+1)^3$ scalar tile into
+shared memory, allowing reuse across cells.
+
+\begin{table}[H]
+\centering
+\caption{DRAM traffic (Nsight Compute).}
+\label{tab:opt3a_dram}
+\begin{tabular}{lcc}
+\toprule
+Kernel Variant & DRAM Reads (MB) & DRAM Writes (MB) \\
+\midrule
+Count (no tiling) & $\sim$9.03 & $\sim$2.18 \\
+Count (tiling)    & $\sim$8.98 & $\sim$2.13 \\
+Emit (no tiling)  & $\sim$49.8 & $\sim$76.7 \\
+Emit (tiling)     & $\sim$57.7 & $\sim$79.7 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Performance and analysis}
+Although tiling reduces scalar-field loads, overall DRAM traffic does not decrease because output writes dominate execution. This shows that optimizations targeting minor contributors do not necessarily improve end-to-end performance.
+
+\subsection{GPU-Side Scalar Field Generation}
+
+\paragraph{Goal}
+Remove CPU-side preprocessing and host--device transfers.
+
+\paragraph{Design}
+A CUDA kernel procedurally generates the scalar field in device memory, supporting both deterministic plane fields and procedural terrain using value noise and fBm.
+
+\paragraph{Performance and analysis}
+Single-frame kernel runtime remains unchanged, as expected. However, this optimization eliminates large host--device transfers and enables a fully GPU-resident pipeline, which is advantageous for dynamic or multi-frame applications.
+
+
+\section{Overall Performance Discussion}
+
+The implementation is memory-bound. Optimizations that reduce
+output serialization and skip unnecessary work provide the largest gains, while attempts to optimize scalar-field reads have limited impact due to dominant output bandwidth.
+
+\section{Future Work: Vertex De-duplication}
+
+A major remaining source of memory traffic in the current implementation is
+vertex duplication. In the present pipeline, vertices are emitted per triangle,
+even though most vertices are shared by multiple neighboring triangles. As a
+result, the number of generated vertices is significantly higher than the number
+of unique geometric vertices, leading to increased global memory writes and
+larger output buffers.
+
+\paragraph{Motivation}
+Profiling results show that the implementation remains memory-bound even after eliminating atomic contention and skipping empty regions. Since vertex and index emission dominates global memory traffic, reducing redundant vertex writes is a
+natural next optimization target. Vertex de-duplication has the potential to substantially reduce output size, DRAM bandwidth usage, and downstream rendering costs.
+
+\paragraph{Possible Approaches}
+Several GPU-friendly approaches could be explored to reduce duplicate vertices:
+\begin{itemize}
+  \item \textbf{Per-chunk edge ownership:} Assign a unique owner to each grid edge within a chunk and emit the corresponding vertex only once. Neighboring cells would reference the shared vertex via an index.
+  \item \textbf{Per-chunk hash table:} Use a small per-chunk hash table with
+        \texttt{atomicCAS} to detect whether a vertex has already been emitted. This approach trades limited atomic usage for reduced output bandwidth.
+  \item \textbf{Ordered edge-based emission:} Enforce a deterministic emission order per chunk so that each edge intersection is generated exactly once, followed by indexed triangle assembly.
+\end{itemize}
+
+All approaches aim to reduce global memory writes at the cost of additional indexing logic and synchronization within a chunk.
+
+\paragraph{Expected Impact}
+Vertex de-duplication is expected to significantly reduce the number of emitted vertices, especially for smooth surfaces where most vertices are shared. This should lower DRAM write traffic and reduce memory pressure in the emission stage, potentially shifting the kernel closer to a balanced compute--memory regime. While additional synchronization or bookkeeping may introduce overhead, the net effect is expected to be positive for large grids where output bandwidth dominates runtime.
+
+\paragraph{Challenges}
+Implementing vertex de-duplication on the GPU introduces non-trivial complexity, including synchronization within chunks, management of shared data structures, and potential contention in hash-based schemes. Careful design is required to balance reduced memory traffic against added control overhead.
+
+Despite these challenges, vertex de-duplication represents the most promising next step for improving both performance and memory efficiency of the Marching Cubes pipeline.
+
+
+\section{Conclusion}
+
+This project demonstrates a CUDA Marching Cubes pipeline with profiling-driven optimizations. Removing global atomic contention and culling empty regions provides the most significant speedups. Future work should focus on reducing
+output bandwidth, such as vertex de-duplication and more compact mesh representations.
+
+\end{document}
